@@ -1,61 +1,60 @@
-require('dotenv').config();            // chỉ cần khi chạy local với .env
+require('dotenv').config();
 const express = require('express');
 const { Client } = require('pg');
 const redis = require('redis');
 
 const app = express();
 const port = process.env.PORT || 3000;
-
-// Body parser
 app.use(express.json());
 
 // --- PostgreSQL setup ---
 const pgClient = new Client({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false     // nếu DB yêu cầu SSL tự ký
-  }
+  ssl: { rejectUnauthorized: false }   // Neon yêu cầu SSL tự ký
 });
 
 pgClient.connect()
-  .then(() => console.log('✅ Connected to PostgreSQL'))
-  .catch(err => console.error('❌ PostgreSQL connection error', err.stack));
+  .then(() => {
+    console.log('✅ Connected to PostgreSQL');
+    return pgClient.query(`
+      CREATE TABLE IF NOT EXISTS public.users (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL
+      );
+    `);
+  })
+  .then(() => console.log('✅ Table "users" is ready'))
+  .catch(err => console.error('❌ PostgreSQL error', err.stack));
 
-// Tạo bảng users nếu chưa tồn tại
-pgClient.query(`
-  CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL
-  );
-`).catch(err => console.error('Error creating users table', err.stack));
-
-// --- Redis setup ---
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL
-});
-
-redisClient.on('error', err => console.error('❌ Redis Client Error', err));
-redisClient.connect()
-  .then(() => console.log('✅ Connected to Redis'))
-  .catch(err => console.error('❌ Redis connection error', err));
+// --- Redis setup (tùy chọn) ---
+let redisClient;
+if (process.env.REDIS_URL) {
+  redisClient = redis.createClient({ url: process.env.REDIS_URL });
+  redisClient.on('error', err => console.error('❌ Redis Error', err));
+  redisClient.connect()
+    .then(() => console.log('✅ Connected to Redis'))
+    .catch(err => console.error('❌ Redis connection error', err));
+}
 
 // --- ROUTES ---
-// GET all users (with optional cache refresh)
+// GET all users (cache with Redis nếu có)
 app.get('/data', async (req, res) => {
   try {
-    if (req.query.refresh === 'true') {
+    if (redisClient && req.query.refresh === 'true') {
       await redisClient.del('data');
     }
 
-    const cache = await redisClient.get('data');
-    if (cache) {
-      return res.json(JSON.parse(cache));
+    if (redisClient) {
+      const cache = await redisClient.get('data');
+      if (cache) return res.json(JSON.parse(cache));
     }
 
-    const result = await pgClient.query('SELECT * FROM users');
-    await redisClient.setEx('data', 60, JSON.stringify(result.rows));
-    res.json(result.rows);
+    const { rows } = await pgClient.query('SELECT * FROM public.users');
+    if (redisClient) {
+      await redisClient.setEx('data', 60, JSON.stringify(rows));
+    }
+    res.json(rows);
 
   } catch (err) {
     console.error('Error fetching data', err.stack || err);
@@ -68,10 +67,10 @@ app.post('/data', async (req, res) => {
   const { name, email } = req.body;
   try {
     await pgClient.query(
-      'INSERT INTO users (name, email) VALUES ($1, $2)',
+      'INSERT INTO public.users (name, email) VALUES ($1, $2)',
       [name, email]
     );
-    await redisClient.del('data');
+    if (redisClient) await redisClient.del('data');
     res.status(201).send('Data added successfully');
   } catch (err) {
     console.error('Error inserting data', err.stack || err);
@@ -85,10 +84,10 @@ app.put('/data/:id', async (req, res) => {
   const { name, email } = req.body;
   try {
     await pgClient.query(
-      'UPDATE users SET name = $1, email = $2 WHERE id = $3',
+      'UPDATE public.users SET name = $1, email = $2 WHERE id = $3',
       [name, email, id]
     );
-    await redisClient.del('data');
+    if (redisClient) await redisClient.del('data');
     res.send('Data updated successfully');
   } catch (err) {
     console.error('Error updating data', err.stack || err);
@@ -100,8 +99,8 @@ app.put('/data/:id', async (req, res) => {
 app.delete('/data/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    await pgClient.query('DELETE FROM users WHERE id = $1', [id]);
-    await redisClient.del('data');
+    await pgClient.query('DELETE FROM public.users WHERE id = $1', [id]);
+    if (redisClient) await redisClient.del('data');
     res.send('Data deleted successfully');
   } catch (err) {
     console.error('Error deleting data', err.stack || err);
